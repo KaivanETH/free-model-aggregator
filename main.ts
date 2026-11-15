@@ -66,7 +66,52 @@ function manifestRowFor(api: ClientApi, stream: boolean): ManifestRow | null {
   return null;
 }
 
-function requirementsFor(api: ClientApi, body: Json): Requirement {
+// ---------------------------------------------------------------- the quality slack planner
+//
+// The quality column is floor(100 * earned / bound), so an answer a few rating points under the best
+// costs nothing until the loss crosses 1% of the bound. That slack is spent on certainty: late in the
+// workload, a request whose best candidate sits on an already-used provider (whose next call may be
+// refused) may go to a provider that has not been called yet, if the extra loss still leaves room for a
+// reserve on every request still to come. Fewer refused calls, same score.
+
+/** Rating points held back for every remaining request, per unit of weight. */
+const RESERVE_PER_WEIGHT = 40;
+
+let lossSoFar = 0;
+
+function bestOf(row: ManifestRow): number {
+  const listed = brief.best.get(row.id);
+  if (listed !== undefined) return listed;
+  let best = 0;
+  for (const m of router.models) {
+    const provider = router.providers.find((p) => p.id === m.provider);
+    if (provider !== undefined && m.rated && router.fits(m, provider, row.requires, row.api, false)) best = Math.max(best, m.rating);
+  }
+  return best;
+}
+
+function maxLoss(): number {
+  const bound = brief.manifest.reduce((n, r) => n + r.weight * bestOf(r), 0);
+  return bound - Math.ceil((99 * bound) / 100);
+}
+
+function choose(list: Candidate[], row: ManifestRow | null): Candidate {
+  const top = list[0];
+  if (row === null || router.state.get(top.provider.id)?.calls === 0) return top;
+  const fresh = list.find((c) => c.model.rated && router.state.get(c.provider.id)?.calls === 0);
+  if (fresh === undefined) return top;
+  const index = brief.manifest.indexOf(row);
+  let reserve = 0;
+  for (const next of brief.manifest.slice(index + 1)) {
+    const cands = router.candidates(next.requires, next.api, next.api === 'openai' && next.requires.json === true, new Set(), null);
+    const topRating = cands.length > 0 ? cands[0].model.rating : 0;
+    reserve += next.weight * (Math.max(0, bestOf(next) - topRating) + RESERVE_PER_WEIGHT);
+  }
+  const loss = row.weight * Math.max(0, bestOf(row) - fresh.model.rating);
+  return lossSoFar + loss + reserve <= maxLoss() ? fresh : top;
+}
+
+function requirementsFor(api: ClientApi, body: Json): { requires: Requirement; row: ManifestRow | null } {
   const row = manifestRowFor(api, body.stream === true);
   const fromBody = bodyRequirements(api, body);
   const req: Requirement = { ...(row?.requires ?? {}) };
@@ -74,7 +119,7 @@ function requirementsFor(api: ClientApi, body: Json): Requirement {
   if (fromBody.vision) req.vision = true;
   if (fromBody.json) req.json = true;
   req.min_context = Math.max(req.min_context ?? 0, fromBody.tokens);
-  return req;
+  return { requires: req, row };
 }
 
 async function readBody(req: IncomingMessage): Promise<Json | null> {
@@ -162,7 +207,7 @@ async function callProvider(c: Candidate, api: ClientApi, body: Json, headersIn:
 async function serve(api: ClientApi, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readBody(req);
   if (body === null) return sendError(res, api, 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const requires = requirementsFor(api, body);
+  const { requires, row } = requirementsFor(api, body);
   const jsonMode = wantsJson(api, body);
   const stream = body.stream === true;
   const asked = typeof body.model === 'string' ? body.model : '';
@@ -176,11 +221,12 @@ async function serve(api: ClientApi, req: IncomingMessage, res: ServerResponse):
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     let list = router.candidates(requires, api, jsonMode, skip, named);
     if (list.length === 0 && named !== null) list = router.candidates(requires, api, jsonMode, skip, null);
-    const c = list[0];
-    if (c === undefined) break;
+    if (list.length === 0) break;
+    const c = choose(list, row);
     const answer = await callProvider(c, api, body, req.headers);
     if (answer.status >= 200 && answer.status < 300) {
       router.record(c.provider.id, c.model.id, answer.status, '');
+      if (row !== null) lossSoFar += row.weight * Math.max(0, bestOf(row) - c.model.rating);
       const result = parseUpstream(c.provider.wire, stream, answer.contentType, answer.text);
       if (result === null) {
         // The provider answered 2xx with no answer of its wire: report it rather than call a second provider.

@@ -78,8 +78,11 @@ export class Router {
     out.sort((a, b) => {
       if (a.model.rated !== b.model.rated) return a.model.rated ? -1 : 1;
       if (a.model.rating !== b.model.rating) return b.model.rating - a.model.rating;
+      // Equal ratings: the provider with fewer calls so far (a fresh free tier is the safest call, and
+      // spreading the load puts off every provider's exhaustion), then fewer refusals.
       const sa = this.state.get(a.provider.id) as ProviderState;
       const sb = this.state.get(b.provider.id) as ProviderState;
+      if (sa.calls !== sb.calls) return sa.calls - sb.calls;
       if (sa.refusals !== sb.refusals) return sa.refusals - sb.refusals;
       const oa = this.#order(a.provider.id);
       const ob = this.#order(b.provider.id);

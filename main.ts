@@ -117,8 +117,11 @@ function errorMessage(text: string): string {
   try {
     const v: unknown = JSON.parse(text);
     if (isRecord(v)) {
+      // The message alone: a provider's error code (rate_limit_exceeded, RESOURCE_EXHAUSTED, ...) is the
+      // same for a rate-limit window and a spent budget, so only the human text tells them apart.
       const e = isRecord(v.error) ? v.error : v;
-      return [e.message, e.code, e.status, e.type].filter((x) => typeof x === 'string').join(' ');
+      if (typeof e.message === 'string' && e.message !== '') return e.message;
+      return [e.code, e.status, e.type].filter((x) => typeof x === 'string').join(' ');
     }
   } catch {
     // not JSON
